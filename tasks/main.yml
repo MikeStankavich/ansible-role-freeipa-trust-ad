@@ -1,0 +1,76 @@
+#---
+- name: Disable DNSSEC so that forwarders to Windows work without figuring out DNSSEC on M$
+  replace:
+    dest: /etc/named.conf
+    regexp: dnssec-(enable|validation) yes;
+    replace: dnssec-\1 no;
+  register: disable_dnssec
+  when: true   # hook to a variable
+
+- name: Restart named service
+  service:
+    name: named-pkcs11
+    state: restarted
+  when: disable_dnssec.changed
+
+- name: Init Kerberos
+  expect:
+    command: kinit admin
+    responses:
+      assword: "{{ ipaserver_admin_password }}"
+  changed_when: false
+
+# move to list in vars
+- name: Get list of DNS forwarders
+  command: ipa dnsforwardzone-find
+  register: dns_forwarders
+  changed_when: false
+  ignore_errors: true
+
+- name: Add DNS zone forwarder(s)
+  command: ipa dnsforwardzone-add {{ item.name }} --forwarder={{ item.ip }} --forward-policy=only
+  when: "'Zone name: {{ item.name }}' not in dns_forwarders.stdout"
+  with_items: "{{ ipaserver_forwarder_domains }}"
+
+- name: Get AD trust config
+  command: ipa trustconfig-show
+  register: trust_config
+  changed_when: false
+  ignore_errors: true
+  when: ipaserver_trust_ad_domain is defined
+
+- name: Install AD trust config
+  command:
+    ipa-adtrust-install --netbios-name {{ ipaserver_netbios_name }} --unattended --admin-password {{ ipaserver_admin_password }}
+  when: ipaserver_trust_ad_domain is defined and ipaserver_netbios_name not in trust_config.stdout
+  register: install_trust_config
+
+- name: Clear Kerberos ticket
+  command: kdestroy
+  when: ipaserver_trust_ad_domain is defined and install_trust_config.changed
+  changed_when: false
+
+- name: Reinit Kerberos
+  expect:
+    command: kinit admin
+    responses:
+      assword: "{{ ipaserver_admin_password }}"
+  when: ipaserver_trust_ad_domain is defined and install_trust_config.changed
+  changed_when: false
+
+
+- name: Get AD trust domains
+  command: ipa trustdomain-find AD.LOCAL
+  register: trust_domain
+  changed_when: false
+  ignore_errors: true
+  when: ipaserver_trust_ad_domain is defined
+
+# change vars to an object, use vault for password
+- name: Add AD trust
+  expect:
+    command:
+      ipa trust-add --type=ad {{ ipaserver_trust_ad_domain }} --admin {{ ipaserver_trust_ad_admin }} --password
+    responses:
+      assword: "{{ ipaserver_trust_ad_password }}"
+  when: ipaserver_trust_ad_domain is defined and ipaserver_trust_ad_domain not in trust_domain.stdout
